@@ -1055,7 +1055,7 @@ void RenderFrame() {
 
 HWND CreateOutputWindow(const RECT& rc, int sliceIndex) {
     constexpr DWORD style = WS_POPUP;
-    constexpr DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
+    constexpr DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
 
     HWND hwnd = CreateWindowExW(
         exStyle,
@@ -1073,8 +1073,11 @@ HWND CreateOutputWindow(const RECT& rc, int sliceIndex) {
 
     if (!hwnd) return nullptr;
 
-    SetWindowPos(hwnd, HWND_TOPMOST, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_SHOWWINDOW);
-    ShowWindow(hwnd, SW_SHOW);
+    // Required for reliable click-through behavior on some systems.
+    SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+
+    SetWindowPos(hwnd, HWND_TOPMOST, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     UpdateWindow(hwnd);
 
     // Prevent recursive capture: hide these output windows from screen capture APIs.
@@ -1142,6 +1145,10 @@ void StopTakeover() {
 
 LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case WM_NCHITTEST:
+            return HTTRANSPARENT;
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
         case WM_CLOSE:
             return 0;
         case WM_SYSCOMMAND:
