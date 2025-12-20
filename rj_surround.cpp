@@ -82,9 +82,10 @@ struct alignas(16) Constants {
     float invViewW;
     float invViewH;
     float flipX;
+    float latencyUs;
+    float showLatency;
     float pad0;
     float pad1;
-    float pad2;
 };
 
 HINSTANCE g_hInstance{};
@@ -98,6 +99,14 @@ std::mutex g_captureMutex;
 ID3D11ShaderResourceView* g_captureSrv{};
 ID3D11ShaderResourceView* g_captureSrvY{};
 ID3D11ShaderResourceView* g_captureSrvUV{};
+// Captured frame resources.
+//
+// The app keeps an owned GPU texture (`g_captureTex`) that the renderer samples from.
+// Depending on capture backend/format, we may:
+// - Copy directly into BGRA/RGBA (`g_captureTex` + `g_captureSrv`)
+// - Or copy NV12 and use the VideoProcessor to convert to BGRA (`g_captureNv12Tex` -> `g_captureRgbTex`)
+//
+// All of these are written from the capture thread and read from the render thread.
 ID3D11Texture2D* g_captureTex{}; // BGRA/RGBA output texture OR NV12 copy texture (when using plane SRVs)
 ID3D11Texture2D* g_captureNv12Tex{}; // NV12 copy texture used for VP conversion
 ID3D11Texture2D* g_captureRgbTex{};  // BGRA output of VP conversion
@@ -122,7 +131,11 @@ std::atomic<bool> g_captureUsingVp{false};
 
 ID3D11Texture2D* g_debugReadback1x1{};
 
-// Desktop Duplication fallback.
+// Desktop Duplication path.
+//
+// When running in "3 monitor mode" we use Desktop Duplication on each physical monitor and
+// composite them into a single wide texture (e.g. 7680x1440), then the shader slices that
+// wide texture across 3 output windows.
 IDXGIOutputDuplication* g_ddDup[3]{};
 std::atomic<bool> g_useDesktopDuplication{false};
 std::atomic<uint64_t> g_ddFrameCounter{0};
@@ -133,6 +146,15 @@ int g_pxSampleCount = 0;
 
 std::atomic<float> g_dbgFlipX{0.0f};
 std::atomic<float> g_dbgFlipY{0.0f};
+
+std::atomic<long long> g_lastCopyQpc{0};
+long long g_qpcFreq = 0;
+
+// Latency display smoothing: show worst latency once per second (max over last 1s window).
+static long long g_latencyWindowStartQpc = 0;
+static float g_latencyWindowMaxMs = -1.0f;
+static float g_latencyPublishedMs = -1.0f;
+static long long g_latencyLastSeenCopyQpc = 0;
 
 bool g_consoleReady{false};
 
@@ -145,6 +167,76 @@ bool CheckHr(const HRESULT hr, const wchar_t* what) {
     wsprintfW(buf, L"%s failed (hr=0x%08X)", what, static_cast<unsigned>(hr));
     MessageBoxW(nullptr, buf, L"rj_surround", MB_ICONERROR | MB_OK);
     return false;
+}
+
+static void EnsureQpcInit() {
+    if (g_qpcFreq != 0) return;
+    LARGE_INTEGER f{};
+    if (QueryPerformanceFrequency(&f)) {
+        g_qpcFreq = f.QuadPart;
+    }
+}
+
+static void MarkCopyTimestampQpc() {
+    EnsureQpcInit();
+    LARGE_INTEGER t{};
+    if (QueryPerformanceCounter(&t)) {
+        g_lastCopyQpc.store(t.QuadPart, std::memory_order_relaxed);
+    }
+}
+
+static double GetLatencyMsSinceLastCopy() {
+    EnsureQpcInit();
+    if (g_qpcFreq <= 0) return -1.0;
+    const long long copied = g_lastCopyQpc.load(std::memory_order_relaxed);
+    if (copied <= 0) return -1.0;
+    LARGE_INTEGER now{};
+    if (!QueryPerformanceCounter(&now)) return -1.0;
+    const long long dt = now.QuadPart - copied;
+    return (static_cast<double>(dt) * 1000.0) / static_cast<double>(g_qpcFreq);
+}
+
+static float GetLatencyUsSinceLastCopyF() {
+    const double ms = GetLatencyMsSinceLastCopy();
+    if (ms < 0.0) return -1.0f;
+    const double us = ms * 1000.0;
+    if (us > 9999.0) return 9999.0f;
+    return static_cast<float>(us);
+}
+
+static float GetLatencyWorstOverLastSecondMs() {
+    EnsureQpcInit();
+    if (g_qpcFreq <= 0) return -1.0f;
+
+    LARGE_INTEGER now{};
+    if (!QueryPerformanceCounter(&now)) return g_latencyPublishedMs;
+
+    if (g_latencyWindowStartQpc == 0) {
+        g_latencyWindowStartQpc = now.QuadPart;
+        g_latencyWindowMaxMs = -1.0f;
+        g_latencyPublishedMs = -1.0f;
+    }
+
+    // Freeze-on-idle: only incorporate samples when a new frame was actually copied.
+    const long long copiedQpc = g_lastCopyQpc.load(std::memory_order_relaxed);
+    const bool newFrameCopied = (copiedQpc > 0 && copiedQpc != g_latencyLastSeenCopyQpc);
+    float cur = -1.0f;
+    if (newFrameCopied) {
+        g_latencyLastSeenCopyQpc = copiedQpc;
+        cur = GetLatencyUsSinceLastCopyF();
+        if (cur >= 0.0f) {
+            if (g_latencyWindowMaxMs < 0.0f || cur > g_latencyWindowMaxMs) g_latencyWindowMaxMs = cur;
+        }
+    }
+
+    const long long elapsed = now.QuadPart - g_latencyWindowStartQpc;
+    if (elapsed >= g_qpcFreq) {
+        g_latencyPublishedMs = g_latencyWindowMaxMs;
+        g_latencyWindowStartQpc = now.QuadPart;
+        // Start the next window with the most recent sample if we got one; otherwise keep it empty.
+        g_latencyWindowMaxMs = (cur >= 0.0f) ? cur : -1.0f;
+    }
+    return g_latencyPublishedMs;
 }
 
 static const char* DxgiFormatName(uint32_t fmt) {
@@ -484,6 +576,9 @@ bool InitD3D() {
     }
 
     // Shaders.
+    //
+    // We draw a single full-screen triangle (no vertex buffer) and compute UVs from
+    // SV_Position so we are resilient to swapchain/client-size mismatches.
     static const char* kVsSrc =
         "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
         "VSOut main(uint vid : SV_VertexID) {"
@@ -494,12 +589,51 @@ bool InitD3D() {
         "  return o;"
         "}";
 
+    // Pixel shader source (HLSL) used for all output windows.
+    //
+    // How it's used:
+    // - This string is compiled at startup in InitD3D() via D3DCompile(..., "ps_5_0").
+    // - The resulting bytecode is turned into an ID3D11PixelShader (g_d3d.ps).
+    // - Each frame, RenderFrame() updates the constant buffer (g_d3d.cb) with per-window
+    //   values like slice index, viewport size, slice enablement, and latency.
+    // - We then draw a full-screen triangle (Draw(3,0)) into each output swapchain backbuffer.
+    //
+    // Inputs:
+    // - capTex (t0): shader resource view of the current captured/composited texture.
+    // - capSamp (s0): clamp/linear sampler.
+    // - C (b0): constants updated per output window.
     static const char* kPsSrc =
         "Texture2D capTex : register(t0);"
         "SamplerState capSamp : register(s0);"
-        "cbuffer C : register(b0) { float sliceIndex; float timeSeconds; float useCapture; float isNv12; float isBgra; float flipY; float sliceEnabled; float invViewW; float invViewH; float flipX; float pad0; float pad1; float pad2; }"
+        "cbuffer C : register(b0) { float sliceIndex; float timeSeconds; float useCapture; float isNv12; float isBgra; float flipY; float sliceEnabled; float invViewW; float invViewH; float flipX; float latencyUs; float showLatency; float pad0; float pad1; }"
         "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
+        // Small SDF-ish helpers used for the latency overlay (simple 7-segment digits).
+        "float sdBox(float2 p, float2 b) { float2 d = abs(p) - b; return length(max(d,0)) + min(max(d.x,d.y),0); }"
+        "float seg(float2 p, float2 a, float2 b, float r) { float2 pa=p-a, ba=b-a; float h=saturate(dot(pa,ba)/dot(ba,ba)); return length(pa-ba*h)-r; }"
+        "float digit7(float2 p, int d) {"
+        "  float2 A0=float2(-0.35,0.42), A1=float2(0.35,0.42);"
+        "  float2 B0=float2(0.38,0.38),  B1=float2(0.38,0.00);"
+        "  float2 C0=float2(0.38,-0.02), C1=float2(0.38,-0.40);"
+        "  float2 D0=float2(-0.35,-0.42),D1=float2(0.35,-0.42);"
+        "  float2 E0=float2(-0.38,-0.02),E1=float2(-0.38,-0.40);"
+        "  float2 F0=float2(-0.38,0.38), F1=float2(-0.38,0.00);"
+        "  float2 G0=float2(-0.35,0.00), G1=float2(0.35,0.00);"
+        "  int mask=0;"
+        "  if (d==0) mask=0x3F; else if (d==1) mask=0x06; else if (d==2) mask=0x5B; else if (d==3) mask=0x4F;"
+        "  else if (d==4) mask=0x66; else if (d==5) mask=0x6D; else if (d==6) mask=0x7D; else if (d==7) mask=0x07;"
+        "  else if (d==8) mask=0x7F; else if (d==9) mask=0x6F;"
+        "  float r=0.06; float dd=1e9;"
+        "  if (mask&0x01) dd=min(dd, seg(p,A0,A1,r));" // A
+        "  if (mask&0x02) dd=min(dd, seg(p,B0,B1,r));" // B
+        "  if (mask&0x04) dd=min(dd, seg(p,C0,C1,r));" // C
+        "  if (mask&0x08) dd=min(dd, seg(p,D0,D1,r));" // D
+        "  if (mask&0x10) dd=min(dd, seg(p,E0,E1,r));" // E
+        "  if (mask&0x20) dd=min(dd, seg(p,F0,F1,r));" // F
+        "  if (mask&0x40) dd=min(dd, seg(p,G0,G1,r));" // G
+        "  return dd;"
+        "}"
         "float4 main(PSIn i) : SV_Target {"
+        // UV mapping: derive 0..1 from SV_Position and viewport size, then optionally slice.
         "  float2 uv = float2(i.pos.x * invViewW, i.pos.y * invViewH);"
         "  if (sliceEnabled > 0.5) {"
         "    float localX = uv.x;"
@@ -512,6 +646,30 @@ bool InitD3D() {
         "  float4 c = capTex.Sample(capSamp, uv);"
         "  if (useCapture < 0.5) return float4(uv.x, uv.y, 0.15, 1);"
         "  if (isBgra > 0.5) c = c.bgra;"
+        // Latency overlay: GPU-rendered so it remains visible on flip-model + layered windows.
+        "  if (showLatency > 0.5) {"
+        "    float2 p = float2(i.pos.x, i.pos.y);"
+        "    float2 br = float2(256.0, 44.0);" // box size
+        "    float2 tl = float2((1.0/invViewW) - br.x - 12.0, 10.0);" // top-left
+        "    float2 q = (p - (tl + br*0.5)) / br;"
+        "    float box = sdBox(q, float2(0.5,0.5));"
+        "    float a = smoothstep(0.02, -0.02, box);"
+        "    float4 bg = float4(0,0,0,0.45) * a;"
+        "    float us = max(latencyUs, 0.0);"
+        "    int v = (int)(us + 0.5);"
+        "    int d0 = (v/1000)%10; int d1=(v/100)%10; int d2=(v/10)%10; int d3=v%10;"
+        "    float2 lp = (p - (tl + float2(16.0, 10.0))) / float2(24.0, 24.0);"
+        "    lp.y = -lp.y;"
+        "    float ink=0.0;"
+        "    float2 pp = lp;"
+        "    pp.x -= 0.0; ink=max(ink, smoothstep(0.10, 0.00, digit7(pp, d0)));"
+        "    pp = lp; pp.x -= 1.1; ink=max(ink, smoothstep(0.10, 0.00, digit7(pp, d1)));"
+        "    pp = lp; pp.x -= 2.2; ink=max(ink, smoothstep(0.10, 0.00, digit7(pp, d2)));"
+        "    pp = lp; pp.x -= 3.3; ink=max(ink, smoothstep(0.10, 0.00, digit7(pp, d3)));"
+        "    float4 fg = float4(1,1,1,1) * ink * a;"
+        "    c = c*(1.0-bg.a) + bg;"
+        "    c = c*(1.0-fg.a) + fg;"
+        "  }"
         "  return c;"
         "}";
 
@@ -746,6 +904,7 @@ void RenderFrame() {
 
             if (anyFrame) {
                 const uint64_t ddCur = g_ddFrameCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+                MarkCopyTimestampQpc();
                 g_captureCopiedFrameCounter.store(ddCur, std::memory_order_relaxed);
             }
         }
@@ -765,6 +924,7 @@ void RenderFrame() {
                 EnsureCaptureTexture(w, h);
                 if (g_captureTex) {
                     g_d3d.ctx->CopyResource(g_captureTex, src.get());
+                    MarkCopyTimestampQpc();
                     g_captureCopiedFrameCounter.store(curFrame, std::memory_order_relaxed);
                 }
                 lastSeenFrame = curFrame;
@@ -783,10 +943,10 @@ void RenderFrame() {
 
     // Debug output once per second.
     {
-        static uint32_t secTicker = 0;
-        secTicker++;
-        if (secTicker >= 60) {
-            secTicker = 0;
+        static ULONGLONG lastLogMs = 0;
+        const ULONGLONG nowMs = GetTickCount64();
+        if (lastLogMs == 0 || (nowMs - lastLogMs) >= 1000) {
+            lastLogMs = nowMs;
             const bool accessAllowed = g_captureAccessAllowed.load(std::memory_order_relaxed);
             const uint64_t arrived = g_captureFrameCounter.load(std::memory_order_relaxed);
             const uint32_t srcFmt = g_captureSrcFormat.load(std::memory_order_relaxed);
@@ -905,13 +1065,15 @@ void RenderFrame() {
                 }
             }
 
-            char buf[320];
+            const float latencyUs = GetLatencyWorstOverLastSecondMs();
+            char buf[380];
             snprintf(
                 buf,
                 sizeof(buf),
-                "[rj_surround] backend=%s mode=%s fx=%.0f fy=%.0f out=%ux%u win=%ux%u sc=%ux%u bb=%ux%u access=%d arrived=%llu copied=%llu using=%d size=%ux%u srcFmt=%u(%s) ownFmt=%u(%s) px=%08X/%08X/%08X pxOk=%d\n",
+                "[rj_surround] backend=%s mode=%s Latency(uS)=%.0f fx=%.0f fy=%.0f out=%ux%u win=%ux%u sc=%ux%u bb=%ux%u access=%d arrived=%llu copied=%llu using=%d size=%ux%u srcFmt=%u(%s) ownFmt=%u(%s) px=%08X/%08X/%08X pxOk=%d\n",
                 usingDd ? "DD" : "WGC",
                 mode,
+                static_cast<double>(latencyUs),
                 static_cast<double>(logFlipX),
                 static_cast<double>(logFlipY),
                 static_cast<unsigned>(outW),
@@ -1034,13 +1196,17 @@ void RenderFrame() {
             c->flipX = 0.0f;
             c->flipY = 0.0f;
 
+            // Latency value is derived from the last frame copy timestamp and published at 1Hz.
+            // Freeze-on-idle ensures we don't "count" desktop inactivity as increased latency.
+            c->latencyUs = GetLatencyWorstOverLastSecondMs();
+            c->showLatency = (ow.sliceIndex == 1) ? 1.0f : 0.0f;
+
             if (ow.sliceIndex == 0) {
                 g_dbgFlipX.store(c->flipX, std::memory_order_relaxed);
                 g_dbgFlipY.store(c->flipY, std::memory_order_relaxed);
             }
             c->pad0 = 0.0f;
             c->pad1 = 0.0f;
-            c->pad2 = 0.0f;
             g_d3d.ctx->Unmap(g_d3d.cb, 0);
         }
 
@@ -1073,7 +1239,8 @@ HWND CreateOutputWindow(const RECT& rc, int sliceIndex) {
 
     if (!hwnd) return nullptr;
 
-    // Required for reliable click-through behavior on some systems.
+    // Layered+transparent+noactivate yields a click-through, non-focus-stealing overlay.
+    // We still draw into it with DXGI flip-model swapchains.
     SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
 
     SetWindowPos(hwnd, HWND_TOPMOST, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_SHOWWINDOW | SWP_NOACTIVATE);
@@ -1123,7 +1290,7 @@ bool StartTakeover() {
         }
     }
 
-    // Use Desktop Duplication for each monitor and composite into a single wide surface.
+    // Primary runtime mode: Desktop Duplication per monitor -> composite to wide -> slice to 3 windows.
     const MonitorDesc monArr[3] = {mons[0], mons[1], mons[2]};
     if (!StartDesktopDuplicationForMonitors(monArr)) {
         MessageBoxW(nullptr, L"Failed to start Desktop Duplication.", L"rj_surround", MB_OK | MB_ICONERROR);
@@ -1146,8 +1313,10 @@ void StopTakeover() {
 LRESULT CALLBACK OutputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_NCHITTEST:
+            // Make the overlay click-through.
             return HTTRANSPARENT;
         case WM_MOUSEACTIVATE:
+            // Ensure the overlay never steals focus.
             return MA_NOACTIVATE;
         case WM_CLOSE:
             return 0;
