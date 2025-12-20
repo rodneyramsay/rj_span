@@ -77,6 +77,11 @@ struct alignas(16) Constants {
     float useCapture;
     float isNv12;
     float isBgra;
+    float flipY;
+    float sliceEnabled;
+    float invViewW;
+    float invViewH;
+    float flipX;
     float pad0;
     float pad1;
     float pad2;
@@ -125,6 +130,9 @@ uint32_t g_pxA = 0;
 uint32_t g_pxB = 0;
 int g_pxUniqueCount = 0;
 int g_pxSampleCount = 0;
+
+std::atomic<float> g_dbgFlipX{0.0f};
+std::atomic<float> g_dbgFlipY{0.0f};
 
 bool g_consoleReady{false};
 
@@ -489,13 +497,17 @@ bool InitD3D() {
     static const char* kPsSrc =
         "Texture2D capTex : register(t0);"
         "SamplerState capSamp : register(s0);"
-        "cbuffer C : register(b0) { float sliceIndex; float timeSeconds; float useCapture; float isNv12; float isBgra; float pad0; float pad1; float pad2; }"
+        "cbuffer C : register(b0) { float sliceIndex; float timeSeconds; float useCapture; float isNv12; float isBgra; float flipY; float sliceEnabled; float invViewW; float invViewH; float flipX; float pad0; float pad1; float pad2; }"
         "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
         "float4 main(PSIn i) : SV_Target {"
-        "  float flipY = pad0;"
-        "  float sliceEnabled = pad1;"
-        "  float2 uv = i.uv * 0.5;"
-        "  if (sliceEnabled > 0.5) uv.x = (uv.x + sliceIndex) / 3.0;"
+        "  float2 uv = float2(i.pos.x * invViewW, i.pos.y * invViewH);"
+        "  if (sliceEnabled > 0.5) {"
+        "    float localX = uv.x;"
+        "    if (flipX > 0.5) localX = 1.0 - localX;"
+        "    uv.x = (localX + sliceIndex) / 3.0;"
+        "  } else {"
+        "    if (flipX > 0.5) uv.x = 1.0 - uv.x;"
+        "  }"
         "  if (flipY > 0.5) uv.y = 1.0 - uv.y;"
         "  float4 c = capTex.Sample(capSamp, uv);"
         "  if (useCapture < 0.5) return float4(uv.x, uv.y, 0.15, 1);"
@@ -519,7 +531,7 @@ bool InitD3D() {
     psBlob->Release();
 
     D3D11_BUFFER_DESC cbd{};
-    cbd.ByteWidth = sizeof(Constants);
+    cbd.ByteWidth = (sizeof(Constants) + 15u) & ~15u;
     cbd.Usage = D3D11_USAGE_DYNAMIC;
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -798,6 +810,9 @@ void RenderFrame() {
             const bool sliceEnabled = (outW > 0) ? (w >= (outW * 3 - 32)) : false;
             const char* mode = sliceEnabled ? "slice" : "mirror";
 
+            const float logFlipY = g_dbgFlipY.load(std::memory_order_relaxed);
+            const float logFlipX = g_dbgFlipX.load(std::memory_order_relaxed);
+
             UINT cW = 0, cH = 0, scW = 0, scH = 0, bbW = 0, bbH = 0;
             if (!g_outputs.empty() && g_outputs[0].hwnd && g_outputs[0].swapchain) {
                 RECT cr{};
@@ -894,9 +909,11 @@ void RenderFrame() {
             snprintf(
                 buf,
                 sizeof(buf),
-                "[rj_surround] backend=%s mode=%s out=%ux%u win=%ux%u sc=%ux%u bb=%ux%u access=%d arrived=%llu copied=%llu using=%d size=%ux%u srcFmt=%u(%s) ownFmt=%u(%s) px=%08X/%08X/%08X pxOk=%d\n",
+                "[rj_surround] backend=%s mode=%s fx=%.0f fy=%.0f out=%ux%u win=%ux%u sc=%ux%u bb=%ux%u access=%d arrived=%llu copied=%llu using=%d size=%ux%u srcFmt=%u(%s) ownFmt=%u(%s) px=%08X/%08X/%08X pxOk=%d\n",
                 usingDd ? "DD" : "WGC",
                 mode,
+                static_cast<double>(logFlipX),
+                static_cast<double>(logFlipY),
                 static_cast<unsigned>(outW),
                 static_cast<unsigned>(outH),
                 static_cast<unsigned>(cW),
@@ -996,7 +1013,8 @@ void RenderFrame() {
             c->isNv12 = 0.0f;
             c->isBgra = 1.0f;
 
-            c->pad0 = usingDd ? 1.0f : 0.0f; // flipY
+            // DD composite orientation controls (slice-local flipX in shader).
+            c->flipY = usingDd ? 1.0f : 0.0f;
 
             // Only slice when the captured surface is actually ~3 monitors wide.
             UINT capW = 0;
@@ -1006,7 +1024,22 @@ void RenderFrame() {
             }
             const UINT outW = static_cast<UINT>(ow.rc.right - ow.rc.left);
             const bool sliceEnabled = capW >= (outW * 3 - 32);
-            c->pad1 = sliceEnabled ? 1.0f : 0.0f;
+            c->sliceEnabled = sliceEnabled ? 1.0f : 0.0f;
+
+            // Provide viewport size so PS can compute UV from SV_Position robustly.
+            c->invViewW = (clientW > 0) ? (1.0f / static_cast<float>(clientW)) : 0.0f;
+            c->invViewH = (clientH > 0) ? (1.0f / static_cast<float>(clientH)) : 0.0f;
+
+            // Temporarily force flips off so we can verify flip controls actually affect the output.
+            c->flipX = 0.0f;
+            c->flipY = 0.0f;
+
+            if (ow.sliceIndex == 0) {
+                g_dbgFlipX.store(c->flipX, std::memory_order_relaxed);
+                g_dbgFlipY.store(c->flipY, std::memory_order_relaxed);
+            }
+            c->pad0 = 0.0f;
+            c->pad1 = 0.0f;
             c->pad2 = 0.0f;
             g_d3d.ctx->Unmap(g_d3d.cb, 0);
         }
