@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_executable(rj_surround WIN32
-    rj_surround.cpp
+    src/rj_surround.cpp
 )
 
 target_compile_definitions(rj_surround PRIVATE
