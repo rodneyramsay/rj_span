@@ -1,6 +1,6 @@
 # IDD_README
 
-Goal: make Windows 11 (and games) see **one large virtual monitor** (target: **7680x1440 @ 60Hz**) without using NVIDIA Surround.
+Goal: make Windows 11 (and games) see **one large virtual monitor** (target: **7680x1440 @ 120Hz**) without using NVIDIA Surround.
 
 `rj_surround` today draws three click-through full-screen windows and shows a composited capture across 3 physical monitors. That does **not** change what resolutions games enumerate. Games learn available fullscreen modes from Windows’ display stack (WDDM/DXGI) and whatever display devices/drivers are present.
 
@@ -22,7 +22,7 @@ Useful entry points:
 The customization for this project is:
 
 - Expose **exactly 1** virtual monitor.
-- Advertise at least **7680x1440 @ 60Hz** as a supported mode.
+- Advertise **7680x1440 @ 120Hz** as a supported mode.
 - Give it a clear friendly name (so it’s easy to pick in Display Settings / game settings).
 
 ## Tooling prerequisites
@@ -47,11 +47,11 @@ After installing WDK, Visual Studio should be able to open/build the sample driv
 
 The sample can be configured to enumerate multiple monitors. For this project, make it expose **one** target/monitor.
 
-### 2) Add `7680x1440 @ 60Hz` to the mode list
+### 2) Add `7680x1440 @ 120Hz` to the mode list
 
 Start minimal:
 
-- `7680x1440 @ 60Hz`
+- `7680x1440 @ 120Hz`
 
 Add more modes later only if necessary. Keeping the list small reduces games choosing unexpected defaults.
 
@@ -142,4 +142,4 @@ Implementation idea:
 ## Notes / gotchas
 
 - Driver development is a different workflow than app dev: plan for signing and reboots.
-- Start with 60Hz until everything is stable.
+- Keep the mode list minimal until everything is stable.

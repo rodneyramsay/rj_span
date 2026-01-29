@@ -1,3 +1,46 @@
 build/
 *.log
 build_vs/
+
+# Visual Studio
+.vs/
+*.VC.db
+*.VC.VC.opendb
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Common build outputs
+**/Debug/
+**/Release/
+**/x64/
+**/x86/
+**/ARM/
+**/ARM64/
+**/Bin/
+**/obj/
+
+# Driver/WDK outputs
+*.sys
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.cat
+*.cer
+*.inf.log
+*.etl
+*.tmh
+
+# MSBuild logs/intermediate
+**/*.tlog/
+**/*.lastbuildstate
+**/*.idb
+**/*.iobj
+**/*.ipdb
+
+# Windows driver samples repo artifacts
+Windows-Driver/**/packages/
+Windows-Driver/**/.nuget/
+Windows-Driver/**/.vscode/

@@ -44,6 +44,7 @@ namespace {
 constexpr int kHotkeyToggle = 1;
 constexpr int kHotkeyEmergencyStop = 2;
 constexpr int kHotkeyExit = 3;
+constexpr int kHotkeyTestPattern = 4;
 
 struct MonitorDesc {
     HMONITOR handle{};
@@ -100,6 +101,7 @@ struct alignas(16) Constants {
 HINSTANCE g_hInstance{};
 HWND g_hiddenHwnd{};
 bool g_running{};
+std::atomic<bool> g_useTestPattern{false};
 
 std::vector<OutputWindow> g_outputs;
 D3DState g_d3d;
@@ -147,6 +149,7 @@ ID3D11Texture2D* g_debugReadback1x1{};
 // wide texture across 3 output windows.
 IDXGIOutputDuplication* g_ddDup[3]{};
 std::atomic<bool> g_useDesktopDuplication{false};
+std::atomic<bool> g_ddSingleWideMode{false};
 std::atomic<uint64_t> g_ddFrameCounter{0};
 uint32_t g_pxA = 0;
 uint32_t g_pxB = 0;
@@ -169,6 +172,21 @@ bool g_consoleReady{false};
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 void StopTakeover();
+
+static void ToggleTestPattern() {
+    const bool newVal = !g_useTestPattern.load(std::memory_order_relaxed);
+    g_useTestPattern.store(newVal, std::memory_order_relaxed);
+    if (newVal) {
+        g_haveExpectedMode = true;
+        g_expectedWideW = 7680;
+        g_expectedWideH = 1440;
+        g_expectedHz = 120;
+    }
+    if (g_consoleReady) {
+        printf("[rj_surround] TestPattern=%d\n", newVal ? 1 : 0);
+        fflush(stdout);
+    }
+}
 
 bool CheckHr(const HRESULT hr, const wchar_t* what) {
     if (SUCCEEDED(hr)) return true;
@@ -302,6 +320,16 @@ static bool TryGetMonitorCurrentMode(HMONITOR mon, UINT& outW, UINT& outH, UINT&
     outH = static_cast<UINT>(dm.dmPelsHeight);
     outHz = static_cast<UINT>(dm.dmDisplayFrequency);
     return true;
+}
+
+static bool TryGetMonitorDeviceName(HMONITOR mon, wchar_t outDevName[CCHDEVICENAME]) {
+    if (!outDevName) return false;
+    outDevName[0] = L'\0';
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(mon, &mi)) return false;
+    wcsncpy_s(outDevName, CCHDEVICENAME, mi.szDevice, _TRUNCATE);
+    return outDevName[0] != L'\0';
 }
 
 static bool TryDeriveExpectedTripleWideModeFromMonitors(const MonitorDesc mons[3], UINT& outWideW, UINT& outWideH, UINT& outHz) {
@@ -439,6 +467,7 @@ void StopCapture() {
         }
     }
     g_useDesktopDuplication.store(false, std::memory_order_relaxed);
+    g_ddSingleWideMode.store(false, std::memory_order_relaxed);
     g_ddFrameCounter.store(0, std::memory_order_relaxed);
     g_pxA = 0;
     g_pxB = 0;
@@ -515,6 +544,62 @@ static bool StartDesktopDuplicationForMonitors(const MonitorDesc mons[3]) {
     adapter->Release();
 
     g_useDesktopDuplication.store(true, std::memory_order_relaxed);
+    g_ddSingleWideMode.store(false, std::memory_order_relaxed);
+    g_ddFrameCounter.store(0, std::memory_order_relaxed);
+    return true;
+}
+
+static bool StartDesktopDuplicationForWideMonitor(const MonitorDesc& mon) {
+    if (!g_d3d.device) return false;
+
+    StopCapture();
+
+    IDXGIDevice* dxgiDevice = nullptr;
+    HRESULT hr = g_d3d.device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDevice));
+    if (FAILED(hr) || !dxgiDevice) return false;
+
+    IDXGIAdapter* adapter = nullptr;
+    hr = dxgiDevice->GetAdapter(&adapter);
+    dxgiDevice->Release();
+    if (FAILED(hr) || !adapter) return false;
+
+    IDXGIOutput* output = nullptr;
+    for (UINT i = 0;; i++) {
+        IDXGIOutput* out = nullptr;
+        hr = adapter->EnumOutputs(i, &out);
+        if (hr == DXGI_ERROR_NOT_FOUND) break;
+        if (FAILED(hr) || !out) continue;
+
+        DXGI_OUTPUT_DESC od{};
+        if (SUCCEEDED(out->GetDesc(&od)) && od.Monitor == mon.handle) {
+            output = out;
+            break;
+        }
+        out->Release();
+    }
+
+    if (!output) {
+        adapter->Release();
+        return false;
+    }
+
+    IDXGIOutput1* output1 = nullptr;
+    hr = output->QueryInterface(__uuidof(IDXGIOutput1), reinterpret_cast<void**>(&output1));
+    output->Release();
+    if (FAILED(hr) || !output1) {
+        adapter->Release();
+        return false;
+    }
+
+    hr = output1->DuplicateOutput(g_d3d.device, &g_ddDup[0]);
+    output1->Release();
+    adapter->Release();
+    if (FAILED(hr) || !g_ddDup[0]) {
+        return false;
+    }
+
+    g_useDesktopDuplication.store(true, std::memory_order_relaxed);
+    g_ddSingleWideMode.store(true, std::memory_order_relaxed);
     g_ddFrameCounter.store(0, std::memory_order_relaxed);
     return true;
 }
@@ -673,8 +758,8 @@ bool InitD3D() {
         "    if (flipX > 0.5) uv.x = 1.0 - uv.x;"
         "  }"
         "  if (flipY > 0.5) uv.y = 1.0 - uv.y;"
-        "  float4 c = capTex.Sample(capSamp, uv);"
         "  if (useCapture < 0.5) return float4(uv.x, uv.y, 0.15, 1);"
+        "  float4 c = capTex.Sample(capSamp, uv);"
         "  if (isBgra > 0.5) c = c.bgra;"
         "  return c;"
         "}";
@@ -878,7 +963,40 @@ void RenderFrame() {
     LARGE_INTEGER qpcAfterCapture{};
     {
         const bool useDd = g_useDesktopDuplication.load(std::memory_order_relaxed);
-        if (useDd && g_ddDup[0] && g_ddDup[1] && g_ddDup[2]) {
+        const bool singleWide = g_ddSingleWideMode.load(std::memory_order_relaxed);
+        if (useDd && singleWide && g_ddDup[0]) {
+            DXGI_OUTDUPL_FRAME_INFO info{};
+            IDXGIResource* res = nullptr;
+            HRESULT hr = g_ddDup[0]->AcquireNextFrame(0, &info, &res);
+            if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+                // No new frame this tick.
+            } else if (hr == DXGI_ERROR_ACCESS_LOST) {
+                // Let the caller recover by stopping takeover.
+            } else if (SUCCEEDED(hr) && res) {
+                ID3D11Texture2D* tex2d = nullptr;
+                hr = res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&tex2d));
+                if (SUCCEEDED(hr) && tex2d) {
+                    D3D11_TEXTURE2D_DESC td{};
+                    tex2d->GetDesc(&td);
+                    g_captureSrcFormat.store(static_cast<uint32_t>(td.Format), std::memory_order_relaxed);
+                    {
+                        std::scoped_lock lk(g_captureMutex);
+                        g_captureW = td.Width;
+                        g_captureH = td.Height;
+                    }
+                    EnsureCaptureTexture(td.Width, td.Height);
+                    if (g_captureTex) {
+                        g_d3d.ctx->CopyResource(g_captureTex, tex2d);
+                        const uint64_t ddCur = g_ddFrameCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+                        MarkCopyTimestampQpc();
+                        g_captureCopiedFrameCounter.store(ddCur, std::memory_order_relaxed);
+                    }
+                }
+                if (tex2d) tex2d->Release();
+                res->Release();
+                (void)g_ddDup[0]->ReleaseFrame();
+            }
+        } else if (useDd && g_ddDup[0] && g_ddDup[1] && g_ddDup[2]) {
             // Composite 3 monitor frames into one wide texture.
             // IMPORTANT: Don't use window RECT sizes here (they can be DPI-logical). Use the actual
             // Desktop Duplication frame texture dimensions.
@@ -986,8 +1104,9 @@ void RenderFrame() {
 
     (void)QueryPerformanceCounter(&qpcAfterCapture);
 
+    const bool usingTestPattern = g_useTestPattern.load(std::memory_order_relaxed);
     ID3D11ShaderResourceView* srvLocal = nullptr;
-    {
+    if (!usingTestPattern) {
         std::scoped_lock lk(g_captureMutex);
         srvLocal = g_captureSrv;
         if (srvLocal) srvLocal->AddRef();
@@ -1005,11 +1124,18 @@ void RenderFrame() {
             const ULONGLONG prevLogMs = lastLogMs;
             lastLogMs = nowMs;
             const bool usingDd = g_useDesktopDuplication.load(std::memory_order_relaxed);
+            const bool ddSingleWide = g_ddSingleWideMode.load(std::memory_order_relaxed);
+            const bool usingTest = g_useTestPattern.load(std::memory_order_relaxed);
             UINT w = 0, h = 0;
             {
                 std::scoped_lock lk(g_captureMutex);
                 w = g_captureW;
                 h = g_captureH;
+            }
+
+            if (usingTest) {
+                w = 7680;
+                h = 1440;
             }
 
             const uint64_t rendered = s_renderFrameCounter;
@@ -1052,12 +1178,14 @@ void RenderFrame() {
             s_maxTotalMs = 0.0;
             s_accFrameCount = 0;
 
-            char buf[420];
+            const char* ddModeStr = usingDd ? (ddSingleWide ? "single_wide" : "triple_composite") : "-";
+            char buf[520];
             snprintf(
                 buf,
                 sizeof(buf),
-                "[rj_surround] backend=%s fps=%.1f Latency(uS)=%.0f size=%ux%u expected=%ux%u@%u avg(ms) total=%.2f wait=%.2f cap=%.2f render=%.2f present=%.2f max(ms) wait=%.2f present=%.2f total=%.2f\n",
-                usingDd ? "DD" : "WGC",
+                "[rj_surround] backend=%s ddmode=%s fps=%.1f Latency(uS)=%.0f size=%ux%u expected=%ux%u@%u avg(ms) total=%.2f wait=%.2f cap=%.2f render=%.2f present=%.2f max(ms) wait=%.2f present=%.2f total=%.2f\n",
+                usingTest ? "TEST" : (usingDd ? "DD" : "WGC"),
+                ddModeStr,
                 static_cast<double>(fps),
                 static_cast<double>(latencyUs),
                 static_cast<unsigned>(w),
@@ -1138,6 +1266,12 @@ void RenderFrame() {
         g_d3d.ctx->RSSetViewports(1, &vp);
 
         float clear[4] = {0.02f, 0.02f, 0.02f, 1.0f};
+        if (usingTestPattern) {
+            clear[0] = 0.35f;
+            clear[1] = 0.02f;
+            clear[2] = 0.35f;
+            clear[3] = 1.0f;
+        }
         g_d3d.ctx->OMSetRenderTargets(1, &ow.rtv, nullptr);
         g_d3d.ctx->ClearRenderTargetView(ow.rtv, clear);
 
@@ -1145,12 +1279,13 @@ void RenderFrame() {
         if (SUCCEEDED(g_d3d.ctx->Map(g_d3d.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
             auto* c = reinterpret_cast<Constants*>(map.pData);
             const bool usingDd = g_useDesktopDuplication.load(std::memory_order_relaxed);
+            const bool usingTest = g_useTestPattern.load(std::memory_order_relaxed);
 
             // When using the 3-monitor compositor, we already place monitors left-to-right in the
             // wide texture, so the slice order should match the window order.
             c->sliceIndex = static_cast<float>(ow.sliceIndex);
             c->timeSeconds = timeSeconds;
-            c->useCapture = (g_captureCopiedFrameCounter.load(std::memory_order_relaxed) > 0) ? 1.0f : 0.0f;
+            c->useCapture = (!usingTest && (g_captureCopiedFrameCounter.load(std::memory_order_relaxed) > 0)) ? 1.0f : 0.0f;
             c->isNv12 = 0.0f;
             c->isBgra = 0.0f;
 
@@ -1165,7 +1300,7 @@ void RenderFrame() {
             }
             const UINT outW = static_cast<UINT>(ow.rc.right - ow.rc.left);
             const UINT expectedW = g_haveExpectedMode ? g_expectedWideW : (outW * 3);
-            const bool sliceEnabled = capW >= (expectedW - 32);
+            const bool sliceEnabled = usingTest ? true : (capW >= (expectedW - 32));
             c->sliceEnabled = sliceEnabled ? 1.0f : 0.0f;
 
             // Provide viewport size so PS can compute UV from SV_Position robustly.
@@ -1281,11 +1416,49 @@ bool StartTakeover() {
         return false;
     }
 
-    mons.resize(3);
+    // Option B: if a single wide monitor (expected IDD virtual display) is present, capture it and
+    // use the remaining 3 monitors as physical outputs.
+    int wideIdx = -1;
+    {
+        for (size_t i = 0; i < mons.size(); i++) {
+            UINT w = 0, h = 0, hz = 0;
+            if (!TryGetMonitorCurrentMode(mons[i].handle, w, h, hz)) continue;
+            if (w >= 7600 && h == 1440) {
+                wideIdx = static_cast<int>(i);
+                g_haveExpectedMode = true;
+                g_expectedWideW = w;
+                g_expectedWideH = h;
+                g_expectedHz = hz;
+                if (g_consoleReady) {
+                    wchar_t dev[CCHDEVICENAME] = {};
+                    if (!TryGetMonitorDeviceName(mons[i].handle, dev)) {
+                        dev[0] = L'?';
+                        dev[1] = L'\0';
+                    }
+                    char devA[64] = {};
+                    (void)WideCharToMultiByte(CP_UTF8, 0, dev, -1, devA, static_cast<int>(sizeof(devA)), nullptr, nullptr);
+                    printf("[rj_surround] DD wide candidate: dev=%s %ux%u@%u\n", devA, static_cast<unsigned>(w), static_cast<unsigned>(h), static_cast<unsigned>(hz));
+                    fflush(stdout);
+                }
+                break;
+            }
+        }
+    }
 
-    g_activeMons[0] = mons[0];
-    g_activeMons[1] = mons[1];
-    g_activeMons[2] = mons[2];
+    std::vector<MonitorDesc> outs;
+    outs.reserve(3);
+    for (size_t i = 0; i < mons.size() && outs.size() < 3; i++) {
+        if (static_cast<int>(i) == wideIdx) continue;
+        outs.push_back(mons[i]);
+    }
+    if (outs.size() < 3) {
+        MessageBoxW(nullptr, L"Need at least 3 physical monitors enabled (excluding the wide virtual display).", L"rj_surround", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    g_activeMons[0] = outs[0];
+    g_activeMons[1] = outs[1];
+    g_activeMons[2] = outs[2];
     g_haveActiveMons = true;
 
     if (!InitD3D()) {
@@ -1296,9 +1469,9 @@ bool StartTakeover() {
     g_outputs.clear();
     g_outputs.resize(3);
     for (int i = 0; i < 3; i++) {
-        g_outputs[i].rc = mons[i].rc;
+        g_outputs[i].rc = outs[i].rc;
         g_outputs[i].sliceIndex = i;
-        g_outputs[i].hwnd = CreateOutputWindow(mons[i].rc, i);
+        g_outputs[i].hwnd = CreateOutputWindow(outs[i].rc, i);
         if (!g_outputs[i].hwnd) {
             MessageBoxW(nullptr, L"Failed to create output window.", L"rj_surround", MB_OK | MB_ICONERROR);
             DestroyOutputs();
@@ -1315,17 +1488,23 @@ bool StartTakeover() {
         }
     }
 
-    // Primary runtime mode: Desktop Duplication per monitor -> composite to wide -> slice to 3 windows.
-    const MonitorDesc monArr[3] = {mons[0], mons[1], mons[2]};
-    if (!StartDesktopDuplicationForMonitors(monArr)) {
-        MessageBoxW(nullptr, L"Failed to start Desktop Duplication.", L"rj_surround", MB_OK | MB_ICONERROR);
-        StopTakeover();
-        return false;
-    }
+    const MonitorDesc outArr[3] = {outs[0], outs[1], outs[2]};
+    if (wideIdx >= 0) {
+        if (!StartDesktopDuplicationForWideMonitor(mons[static_cast<size_t>(wideIdx)])) {
+            MessageBoxW(nullptr, L"Failed to start Desktop Duplication for wide monitor.", L"rj_surround", MB_OK | MB_ICONERROR);
+            StopTakeover();
+            return false;
+        }
+    } else {
+        // Fallback: Desktop Duplication per monitor -> composite to wide -> slice to 3 windows.
+        if (!StartDesktopDuplicationForMonitors(outArr)) {
+            MessageBoxW(nullptr, L"Failed to start Desktop Duplication.", L"rj_surround", MB_OK | MB_ICONERROR);
+            StopTakeover();
+            return false;
+        }
 
-    {
         UINT wideW = 0, wideH = 0, hz = 0;
-        g_haveExpectedMode = TryDeriveExpectedTripleWideModeFromMonitors(monArr, wideW, wideH, hz);
+        g_haveExpectedMode = TryDeriveExpectedTripleWideModeFromMonitors(outArr, wideW, wideH, hz);
         if (g_haveExpectedMode) {
             g_expectedWideW = wideW;
             g_expectedWideH = wideH;
@@ -1378,6 +1557,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (wParam == kHotkeyToggle) {
                 if (g_running) StopTakeover();
                 else StartTakeover();
+                return 0;
+            }
+            if (wParam == kHotkeyTestPattern) {
+                ToggleTestPattern();
                 return 0;
             }
             if (wParam == kHotkeyEmergencyStop) {
@@ -1445,7 +1628,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         g_consoleReady = true;
         SetConsoleTitleW(L"rj_surround debug");
         printf("rj_surround debug console\n");
-        printf("Hotkeys: Ctrl+Alt+S toggle, Ctrl+Alt+Q stop, Ctrl+Alt+X exit\n");
+        printf("Hotkeys: Ctrl+Alt+S toggle, Ctrl+Alt+Q stop, Ctrl+Alt+T testpattern, Ctrl+Alt+X exit\n");
     }
 
     // Request permission for programmatic capture. Without this, Windows may provide placeholder frames.
@@ -1495,6 +1678,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         MessageBoxW(nullptr, L"Failed to register Ctrl+Alt+X hotkey.", L"rj_surround", MB_OK | MB_ICONERROR);
         return 1;
     }
+    if (!RegisterHotKey(g_hiddenHwnd, kHotkeyTestPattern, MOD_CONTROL | MOD_ALT, 'T')) {
+        MessageBoxW(nullptr, L"Failed to register Ctrl+Alt+T hotkey.", L"rj_surround", MB_OK | MB_ICONERROR);
+        return 1;
+    }
 
     MSG msg{};
     for (;;) {
@@ -1502,6 +1689,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
             if (msg.message == WM_QUIT) {
                 UnregisterHotKey(g_hiddenHwnd, kHotkeyToggle);
                 UnregisterHotKey(g_hiddenHwnd, kHotkeyEmergencyStop);
+                UnregisterHotKey(g_hiddenHwnd, kHotkeyTestPattern);
                 UnregisterHotKey(g_hiddenHwnd, kHotkeyExit);
                 return static_cast<int>(msg.wParam);
             }
